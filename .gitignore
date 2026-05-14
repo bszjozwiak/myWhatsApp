@@ -8,6 +8,10 @@
 *.so
 *.dylib
 
+# Module-root binaries produced by `go build` in each module dir
+/client/client
+/server/server
+
 # Test binary, built with `go test -c`
 *.test
 
