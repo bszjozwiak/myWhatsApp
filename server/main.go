@@ -15,6 +15,7 @@ import (
 	"github.com/gorilla/websocket"
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/oklog/ulid/v2"
+	"github.com/redis/go-redis/v9"
 )
 
 const maxConsecutiveBadFrames = 5
@@ -43,6 +44,7 @@ type message struct {
 	Sender    string
 	Recipient string
 	Body      string
+	CreatedAt time.Time
 }
 
 type inboundMsg struct {
@@ -51,8 +53,20 @@ type inboundMsg struct {
 	Traceparent string `json:"traceparent"`
 }
 
+type outboundPayload struct {
+	ID        string    `json:"id"`
+	From      string    `json:"from"`
+	To        string    `json:"to"`
+	Body      string    `json:"body"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
 type messageStore interface {
 	insertMessage(ctx context.Context, m message) error
+}
+
+type messagePublisher interface {
+	publish(ctx context.Context, channel string, payload []byte) error
 }
 
 type pgStore struct {
@@ -61,9 +75,17 @@ type pgStore struct {
 
 func (s *pgStore) insertMessage(ctx context.Context, m message) error {
 	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO messages (id, sender, recipient, body) VALUES ($1, $2, $3, $4)`,
-		m.ID, m.Sender, m.Recipient, m.Body)
+		`INSERT INTO messages (id, sender, recipient, body, created_at) VALUES ($1, $2, $3, $4, $5)`,
+		m.ID, m.Sender, m.Recipient, m.Body, m.CreatedAt)
 	return err
+}
+
+type redisPublisher struct {
+	client *redis.Client
+}
+
+func (p *redisPublisher) publish(ctx context.Context, channel string, payload []byte) error {
+	return p.client.Publish(ctx, channel, payload).Err()
 }
 
 var (
@@ -94,7 +116,18 @@ func bootstrapSchema(db *sql.DB) error {
 	return err
 }
 
-func wsHandler(store messageStore) http.HandlerFunc {
+func openRedis(addr string) (*redis.Client, error) {
+	client := redis.NewClient(&redis.Options{Addr: addr})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := client.Ping(ctx).Err(); err != nil {
+		_ = client.Close()
+		return nil, err
+	}
+	return client, nil
+}
+
+func wsHandler(store messageStore, pub messagePublisher) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		clientID := r.URL.Query().Get("client_id")
 		if clientID == "" {
@@ -138,6 +171,7 @@ func wsHandler(store messageStore) http.HandlerFunc {
 				Sender:    clientID,
 				Recipient: in.To,
 				Body:      in.Body,
+				CreatedAt: time.Now().UTC(),
 			}
 			if err := store.insertMessage(r.Context(), m); err != nil {
 				slog.Error("insert message failed", "client_id", clientID, "err", err)
@@ -146,8 +180,30 @@ func wsHandler(store messageStore) http.HandlerFunc {
 				return
 			}
 			slog.Info("message ingested", "client_id", clientID, "message_id", m.ID, "to", m.Recipient)
+
+			publishMessage(r.Context(), pub, m)
 		}
 	}
+}
+
+func publishMessage(ctx context.Context, pub messagePublisher, m message) {
+	payload, err := json.Marshal(outboundPayload{
+		ID:        m.ID,
+		From:      m.Sender,
+		To:        m.Recipient,
+		Body:      m.Body,
+		CreatedAt: m.CreatedAt,
+	})
+	if err != nil {
+		slog.Error("publish payload marshal failed", "message_id", m.ID, "err", err)
+		return
+	}
+	channel := "client:" + m.Recipient
+	if err := pub.publish(ctx, channel, payload); err != nil {
+		slog.Error("redis publish failed", "message_id", m.ID, "channel", channel, "err", err)
+		return
+	}
+	slog.Info("message published", "message_id", m.ID, "channel", channel)
 }
 
 func writeClose(conn *websocket.Conn, code int, reason string) {
@@ -170,6 +226,12 @@ func main() {
 		os.Exit(1)
 	}
 
+	redisAddr := os.Getenv("REDIS_ADDR")
+	if redisAddr == "" {
+		slog.Error("REDIS_ADDR is required")
+		os.Exit(1)
+	}
+
 	db, err := openDB(dsn)
 	if err != nil {
 		slog.Error("postgres connect failed", "err", err)
@@ -183,10 +245,19 @@ func main() {
 	}
 	slog.Info("postgres connected; schema ready")
 
+	rdb, err := openRedis(redisAddr)
+	if err != nil {
+		slog.Error("redis connect failed", "err", err)
+		os.Exit(1)
+	}
+	defer rdb.Close()
+	slog.Info("redis connected", "addr", redisAddr)
+
 	store := &pgStore{db: db}
+	pub := &redisPublisher{client: rdb}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/ws", wsHandler(store))
+	mux.HandleFunc("/ws", wsHandler(store, pub))
 
 	addr := ":" + port
 	slog.Info("server listening", "addr", addr)
