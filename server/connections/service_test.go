@@ -1,9 +1,10 @@
-package main
+package connections
 
 import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -11,57 +12,80 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bszjozwiak/myWhatsApp/server/messages"
 	"github.com/gorilla/websocket"
 )
 
-type fakeStore struct {
-	mu       sync.Mutex
-	inserted []message
-	failWith error
+type ingestCall struct {
+	Sender string
+	In     messages.Inbound
 }
 
-func (s *fakeStore) insertMessage(_ context.Context, m message) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.failWith != nil {
-		return s.failWith
+type fakeIngester struct {
+	mu      sync.Mutex
+	calls   []ingestCall
+	returns []messages.Message
+	err     error
+}
+
+func (f *fakeIngester) Ingest(_ context.Context, sender string, in messages.Inbound) (messages.Message, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.err != nil {
+		return messages.Message{}, f.err
 	}
-	s.inserted = append(s.inserted, m)
-	return nil
+	m := messages.Message{
+		ID:        fmt.Sprintf("test-id-%d", len(f.calls)+1),
+		Sender:    sender,
+		Recipient: in.To,
+		Body:      in.Body,
+		CreatedAt: time.Date(2026, 5, 14, 12, 0, 0, 0, time.UTC).Add(time.Duration(len(f.calls)) * time.Second),
+	}
+	f.calls = append(f.calls, ingestCall{Sender: sender, In: in})
+	f.returns = append(f.returns, m)
+	return m, nil
 }
 
-func (s *fakeStore) snapshot() []message {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	out := make([]message, len(s.inserted))
-	copy(out, s.inserted)
+func (f *fakeIngester) snapshotCalls() []ingestCall {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]ingestCall, len(f.calls))
+	copy(out, f.calls)
+	return out
+}
+
+func (f *fakeIngester) snapshotReturns() []messages.Message {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]messages.Message, len(f.returns))
+	copy(out, f.returns)
 	return out
 }
 
 type publishedFrame struct {
-	channel string
-	payload []byte
+	Channel string
+	Payload []byte
 }
 
-type fakePublisher struct {
-	mu       sync.Mutex
-	frames   []publishedFrame
-	failWith error
+type fakeDAO struct {
+	mu     sync.Mutex
+	frames []publishedFrame
+	err    error
 }
 
-func (p *fakePublisher) publish(_ context.Context, channel string, payload []byte) error {
+func (p *fakeDAO) Publish(_ context.Context, channel string, payload []byte) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.failWith != nil {
-		return p.failWith
+	if p.err != nil {
+		return p.err
 	}
 	cp := make([]byte, len(payload))
 	copy(cp, payload)
-	p.frames = append(p.frames, publishedFrame{channel: channel, payload: cp})
+	p.frames = append(p.frames, publishedFrame{Channel: channel, Payload: cp})
 	return nil
 }
 
-func (p *fakePublisher) snapshot() []publishedFrame {
+func (p *fakeDAO) snapshot() []publishedFrame {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	out := make([]publishedFrame, len(p.frames))
@@ -69,13 +93,14 @@ func (p *fakePublisher) snapshot() []publishedFrame {
 	return out
 }
 
-func newTestServer(t *testing.T, store messageStore, pub messagePublisher) *httptest.Server {
+func newTestServer(t *testing.T, ing MessageIngester, dao DAO) *httptest.Server {
 	t.Helper()
-	if pub == nil {
-		pub = &fakePublisher{}
+	if dao == nil {
+		dao = &fakeDAO{}
 	}
+	svc := NewService(ing, dao)
 	mux := http.NewServeMux()
-	mux.HandleFunc("/ws", wsHandler(store, pub))
+	mux.HandleFunc("/ws", svc.HandleWS)
 	return httptest.NewServer(mux)
 }
 
@@ -94,24 +119,21 @@ func waitFor(t *testing.T, cond func() bool, timeout time.Duration) {
 	}
 }
 
-func TestWS_MissingClientIDReturns400(t *testing.T) {
-	srv := newTestServer(t, &fakeStore{}, nil)
+func TestHandleWS_MissingClientIDReturns400(t *testing.T) {
+	srv := newTestServer(t, &fakeIngester{}, nil)
 	defer srv.Close()
 
 	_, resp, err := websocket.DefaultDialer.Dial(wsURL(srv.URL, "/ws"), nil)
 	if err == nil {
 		t.Fatal("expected dial to fail without client_id")
 	}
-	if resp == nil {
-		t.Fatal("expected HTTP response, got nil")
-	}
-	if resp.StatusCode != http.StatusBadRequest {
-		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusBadRequest)
+	if resp == nil || resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %v, want 400", resp)
 	}
 }
 
-func TestWS_EmptyClientIDReturns400(t *testing.T) {
-	srv := newTestServer(t, &fakeStore{}, nil)
+func TestHandleWS_EmptyClientIDReturns400(t *testing.T) {
+	srv := newTestServer(t, &fakeIngester{}, nil)
 	defer srv.Close()
 
 	_, resp, err := websocket.DefaultDialer.Dial(wsURL(srv.URL, "/ws?client_id="), nil)
@@ -123,9 +145,9 @@ func TestWS_EmptyClientIDReturns400(t *testing.T) {
 	}
 }
 
-func TestWS_ValidMessagePersisted(t *testing.T) {
-	store := &fakeStore{}
-	srv := newTestServer(t, store, nil)
+func TestHandleWS_ValidFrameDispatchedToIngester(t *testing.T) {
+	ing := &fakeIngester{}
+	srv := newTestServer(t, ing, nil)
 	defer srv.Close()
 
 	conn, _, err := websocket.DefaultDialer.Dial(wsURL(srv.URL, "/ws?client_id=alice"), nil)
@@ -139,25 +161,23 @@ func TestWS_ValidMessagePersisted(t *testing.T) {
 		t.Fatalf("write failed: %v", err)
 	}
 
-	waitFor(t, func() bool { return len(store.snapshot()) == 1 }, 2*time.Second)
-	got := store.snapshot()
-	if len(got) != 1 {
-		t.Fatalf("inserted = %d, want 1", len(got))
+	waitFor(t, func() bool { return len(ing.snapshotCalls()) == 1 }, 2*time.Second)
+	calls := ing.snapshotCalls()
+	if len(calls) != 1 {
+		t.Fatalf("ingest calls = %d, want 1", len(calls))
 	}
-	m := got[0]
-	if m.Sender != "alice" || m.Recipient != "bob" || m.Body != "hi" {
-		t.Fatalf("row = %+v, want sender=alice recipient=bob body=hi", m)
+	c := calls[0]
+	if c.Sender != "alice" {
+		t.Fatalf("sender = %q, want alice", c.Sender)
 	}
-	if len(m.ID) != 26 {
-		t.Fatalf("ULID len = %d, want 26 (id=%q)", len(m.ID), m.ID)
-	}
-	if m.CreatedAt.IsZero() {
-		t.Fatalf("CreatedAt is zero, want non-zero timestamp")
+	want := messages.Inbound{To: "bob", Body: "hi", Traceparent: "00-tp-sp-01"}
+	if c.In != want {
+		t.Fatalf("inbound = %+v, want %+v", c.In, want)
 	}
 }
 
-func TestWS_FiveMalformedFramesCloseWith1003(t *testing.T) {
-	srv := newTestServer(t, &fakeStore{}, nil)
+func TestHandleWS_FiveMalformedFramesCloseWith1003(t *testing.T) {
+	srv := newTestServer(t, &fakeIngester{}, nil)
 	defer srv.Close()
 
 	conn, _, err := websocket.DefaultDialer.Dial(wsURL(srv.URL, "/ws?client_id=alice"), nil)
@@ -183,9 +203,9 @@ func TestWS_FiveMalformedFramesCloseWith1003(t *testing.T) {
 	}
 }
 
-func TestWS_BadFrameCounterResetsOnValidFrame(t *testing.T) {
-	store := &fakeStore{}
-	srv := newTestServer(t, store, nil)
+func TestHandleWS_BadFrameCounterResetsOnValidFrame(t *testing.T) {
+	ing := &fakeIngester{}
+	srv := newTestServer(t, ing, nil)
 	defer srv.Close()
 
 	conn, _, err := websocket.DefaultDialer.Dial(wsURL(srv.URL, "/ws?client_id=alice"), nil)
@@ -194,7 +214,6 @@ func TestWS_BadFrameCounterResetsOnValidFrame(t *testing.T) {
 	}
 	defer conn.Close()
 
-	// 4 bad, 1 good, 4 bad — counter must reset on the good frame.
 	for i := 0; i < 4; i++ {
 		if err := conn.WriteMessage(websocket.TextMessage, []byte("nope")); err != nil {
 			t.Fatalf("bad write %d: %v", i, err)
@@ -208,21 +227,19 @@ func TestWS_BadFrameCounterResetsOnValidFrame(t *testing.T) {
 			t.Fatalf("bad write %d: %v", i, err)
 		}
 	}
-
-	// Connection must still be alive — push one more good frame and confirm it lands.
 	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"to":"bob","body":"hi2"}`)); err != nil {
 		t.Fatalf("trailing good write: %v", err)
 	}
 
-	waitFor(t, func() bool { return len(store.snapshot()) == 2 }, 2*time.Second)
-	if got := len(store.snapshot()); got != 2 {
-		t.Fatalf("inserted = %d, want 2 (connection should not have been closed)", got)
+	waitFor(t, func() bool { return len(ing.snapshotCalls()) == 2 }, 2*time.Second)
+	if got := len(ing.snapshotCalls()); got != 2 {
+		t.Fatalf("ingest calls = %d, want 2 (connection should not have been closed)", got)
 	}
 }
 
-func TestWS_InsertFailureSendsErrorAndClosesWith1011(t *testing.T) {
-	store := &fakeStore{failWith: errors.New("simulated pg failure")}
-	srv := newTestServer(t, store, nil)
+func TestHandleWS_IngestErrorSendsErrorAndClosesWith1011(t *testing.T) {
+	ing := &fakeIngester{err: errors.New("simulated pg failure")}
+	srv := newTestServer(t, ing, nil)
 	defer srv.Close()
 
 	conn, _, err := websocket.DefaultDialer.Dial(wsURL(srv.URL, "/ws?client_id=alice"), nil)
@@ -254,10 +271,10 @@ func TestWS_InsertFailureSendsErrorAndClosesWith1011(t *testing.T) {
 	}
 }
 
-func TestWS_PublishesAfterInsert(t *testing.T) {
-	store := &fakeStore{}
-	pub := &fakePublisher{}
-	srv := newTestServer(t, store, pub)
+func TestHandleWS_PublishesAfterIngest(t *testing.T) {
+	ing := &fakeIngester{}
+	dao := &fakeDAO{}
+	srv := newTestServer(t, ing, dao)
 	defer srv.Close()
 
 	conn, _, err := websocket.DefaultDialer.Dial(wsURL(srv.URL, "/ws?client_id=alice"), nil)
@@ -270,37 +287,37 @@ func TestWS_PublishesAfterInsert(t *testing.T) {
 		t.Fatalf("write failed: %v", err)
 	}
 
-	waitFor(t, func() bool { return len(pub.snapshot()) == 1 }, 2*time.Second)
-	frames := pub.snapshot()
+	waitFor(t, func() bool { return len(dao.snapshot()) == 1 }, 2*time.Second)
+	frames := dao.snapshot()
 	if len(frames) != 1 {
 		t.Fatalf("published = %d, want 1", len(frames))
 	}
 	f := frames[0]
-	if f.channel != "client:bob" {
-		t.Fatalf("channel = %q, want client:bob", f.channel)
+	if f.Channel != "client:bob" {
+		t.Fatalf("channel = %q, want client:bob", f.Channel)
 	}
 
-	var got outboundPayload
-	if err := json.Unmarshal(f.payload, &got); err != nil {
-		t.Fatalf("unmarshal payload failed: %v (raw=%s)", err, f.payload)
+	var got messages.Outbound
+	if err := json.Unmarshal(f.Payload, &got); err != nil {
+		t.Fatalf("unmarshal payload failed: %v (raw=%s)", err, f.Payload)
 	}
-	stored := store.snapshot()
-	if len(stored) != 1 {
-		t.Fatalf("stored = %d, want 1", len(stored))
+	returns := ing.snapshotReturns()
+	if len(returns) != 1 {
+		t.Fatalf("ingester returns = %d, want 1", len(returns))
 	}
-	want := stored[0]
+	want := returns[0]
 	if got.ID != want.ID || got.From != "alice" || got.To != "bob" || got.Body != "hello bob" {
 		t.Fatalf("payload = %+v, want id=%s from=alice to=bob body=\"hello bob\"", got, want.ID)
 	}
 	if !got.CreatedAt.Equal(want.CreatedAt) {
-		t.Fatalf("payload CreatedAt = %v, stored CreatedAt = %v", got.CreatedAt, want.CreatedAt)
+		t.Fatalf("payload CreatedAt = %v, ingested CreatedAt = %v", got.CreatedAt, want.CreatedAt)
 	}
 }
 
-func TestWS_PublishFailureDoesNotCloseConnection(t *testing.T) {
-	store := &fakeStore{}
-	pub := &fakePublisher{failWith: errors.New("simulated redis failure")}
-	srv := newTestServer(t, store, pub)
+func TestHandleWS_PublishFailureDoesNotCloseConnection(t *testing.T) {
+	ing := &fakeIngester{}
+	dao := &fakeDAO{err: errors.New("simulated redis failure")}
+	srv := newTestServer(t, ing, dao)
 	defer srv.Close()
 
 	conn, _, err := websocket.DefaultDialer.Dial(wsURL(srv.URL, "/ws?client_id=alice"), nil)
@@ -309,29 +326,27 @@ func TestWS_PublishFailureDoesNotCloseConnection(t *testing.T) {
 	}
 	defer conn.Close()
 
-	// First frame: publish will fail, but DB insert succeeds and connection stays open.
 	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"to":"bob","body":"one"}`)); err != nil {
 		t.Fatalf("write 1 failed: %v", err)
 	}
-	waitFor(t, func() bool { return len(store.snapshot()) == 1 }, 2*time.Second)
-	if n := len(store.snapshot()); n != 1 {
-		t.Fatalf("after publish failure, stored = %d, want 1 (insert must not be rolled back)", n)
+	waitFor(t, func() bool { return len(ing.snapshotCalls()) == 1 }, 2*time.Second)
+	if n := len(ing.snapshotCalls()); n != 1 {
+		t.Fatalf("after publish failure, ingest calls = %d, want 1 (insert must not be rolled back)", n)
 	}
 
-	// Second frame: connection should still be usable.
 	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"to":"bob","body":"two"}`)); err != nil {
 		t.Fatalf("write 2 failed (connection was closed): %v", err)
 	}
-	waitFor(t, func() bool { return len(store.snapshot()) == 2 }, 2*time.Second)
-	if n := len(store.snapshot()); n != 2 {
-		t.Fatalf("stored = %d, want 2", n)
+	waitFor(t, func() bool { return len(ing.snapshotCalls()) == 2 }, 2*time.Second)
+	if n := len(ing.snapshotCalls()); n != 2 {
+		t.Fatalf("ingest calls = %d, want 2", n)
 	}
 }
 
-func TestWS_PublishNotCalledOnInsertFailure(t *testing.T) {
-	store := &fakeStore{failWith: errors.New("simulated pg failure")}
-	pub := &fakePublisher{}
-	srv := newTestServer(t, store, pub)
+func TestHandleWS_PublishNotCalledOnIngestFailure(t *testing.T) {
+	ing := &fakeIngester{err: errors.New("simulated pg failure")}
+	dao := &fakeDAO{}
+	srv := newTestServer(t, ing, dao)
 	defer srv.Close()
 
 	conn, _, err := websocket.DefaultDialer.Dial(wsURL(srv.URL, "/ws?client_id=alice"), nil)
@@ -344,7 +359,6 @@ func TestWS_PublishNotCalledOnInsertFailure(t *testing.T) {
 		t.Fatalf("write failed: %v", err)
 	}
 
-	// Drain the error + close frames so we know the handler finished its work.
 	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
 	for {
 		if _, _, err := conn.ReadMessage(); err != nil {
@@ -352,7 +366,7 @@ func TestWS_PublishNotCalledOnInsertFailure(t *testing.T) {
 		}
 	}
 
-	if frames := pub.snapshot(); len(frames) != 0 {
-		t.Fatalf("publish called %d times on insert failure, want 0", len(frames))
+	if frames := dao.snapshot(); len(frames) != 0 {
+		t.Fatalf("publish called %d times on ingest failure, want 0", len(frames))
 	}
 }
