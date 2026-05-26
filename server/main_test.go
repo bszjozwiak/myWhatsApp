@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -37,10 +38,44 @@ func (s *fakeStore) snapshot() []message {
 	return out
 }
 
-func newTestServer(t *testing.T, store messageStore) *httptest.Server {
+type publishedFrame struct {
+	channel string
+	payload []byte
+}
+
+type fakePublisher struct {
+	mu       sync.Mutex
+	frames   []publishedFrame
+	failWith error
+}
+
+func (p *fakePublisher) publish(_ context.Context, channel string, payload []byte) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.failWith != nil {
+		return p.failWith
+	}
+	cp := make([]byte, len(payload))
+	copy(cp, payload)
+	p.frames = append(p.frames, publishedFrame{channel: channel, payload: cp})
+	return nil
+}
+
+func (p *fakePublisher) snapshot() []publishedFrame {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	out := make([]publishedFrame, len(p.frames))
+	copy(out, p.frames)
+	return out
+}
+
+func newTestServer(t *testing.T, store messageStore, pub messagePublisher) *httptest.Server {
 	t.Helper()
+	if pub == nil {
+		pub = &fakePublisher{}
+	}
 	mux := http.NewServeMux()
-	mux.HandleFunc("/ws", wsHandler(store))
+	mux.HandleFunc("/ws", wsHandler(store, pub))
 	return httptest.NewServer(mux)
 }
 
@@ -48,8 +83,19 @@ func wsURL(httpURL, path string) string {
 	return "ws" + strings.TrimPrefix(httpURL, "http") + path
 }
 
+func waitFor(t *testing.T, cond func() bool, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
 func TestWS_MissingClientIDReturns400(t *testing.T) {
-	srv := newTestServer(t, &fakeStore{})
+	srv := newTestServer(t, &fakeStore{}, nil)
 	defer srv.Close()
 
 	_, resp, err := websocket.DefaultDialer.Dial(wsURL(srv.URL, "/ws"), nil)
@@ -65,7 +111,7 @@ func TestWS_MissingClientIDReturns400(t *testing.T) {
 }
 
 func TestWS_EmptyClientIDReturns400(t *testing.T) {
-	srv := newTestServer(t, &fakeStore{})
+	srv := newTestServer(t, &fakeStore{}, nil)
 	defer srv.Close()
 
 	_, resp, err := websocket.DefaultDialer.Dial(wsURL(srv.URL, "/ws?client_id="), nil)
@@ -79,7 +125,7 @@ func TestWS_EmptyClientIDReturns400(t *testing.T) {
 
 func TestWS_ValidMessagePersisted(t *testing.T) {
 	store := &fakeStore{}
-	srv := newTestServer(t, store)
+	srv := newTestServer(t, store, nil)
 	defer srv.Close()
 
 	conn, _, err := websocket.DefaultDialer.Dial(wsURL(srv.URL, "/ws?client_id=alice"), nil)
@@ -93,15 +139,8 @@ func TestWS_ValidMessagePersisted(t *testing.T) {
 		t.Fatalf("write failed: %v", err)
 	}
 
-	deadline := time.Now().Add(2 * time.Second)
-	var got []message
-	for time.Now().Before(deadline) {
-		got = store.snapshot()
-		if len(got) == 1 {
-			break
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
+	waitFor(t, func() bool { return len(store.snapshot()) == 1 }, 2*time.Second)
+	got := store.snapshot()
 	if len(got) != 1 {
 		t.Fatalf("inserted = %d, want 1", len(got))
 	}
@@ -112,10 +151,13 @@ func TestWS_ValidMessagePersisted(t *testing.T) {
 	if len(m.ID) != 26 {
 		t.Fatalf("ULID len = %d, want 26 (id=%q)", len(m.ID), m.ID)
 	}
+	if m.CreatedAt.IsZero() {
+		t.Fatalf("CreatedAt is zero, want non-zero timestamp")
+	}
 }
 
 func TestWS_FiveMalformedFramesCloseWith1003(t *testing.T) {
-	srv := newTestServer(t, &fakeStore{})
+	srv := newTestServer(t, &fakeStore{}, nil)
 	defer srv.Close()
 
 	conn, _, err := websocket.DefaultDialer.Dial(wsURL(srv.URL, "/ws?client_id=alice"), nil)
@@ -143,7 +185,7 @@ func TestWS_FiveMalformedFramesCloseWith1003(t *testing.T) {
 
 func TestWS_BadFrameCounterResetsOnValidFrame(t *testing.T) {
 	store := &fakeStore{}
-	srv := newTestServer(t, store)
+	srv := newTestServer(t, store, nil)
 	defer srv.Close()
 
 	conn, _, err := websocket.DefaultDialer.Dial(wsURL(srv.URL, "/ws?client_id=alice"), nil)
@@ -172,13 +214,7 @@ func TestWS_BadFrameCounterResetsOnValidFrame(t *testing.T) {
 		t.Fatalf("trailing good write: %v", err)
 	}
 
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if len(store.snapshot()) == 2 {
-			break
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
+	waitFor(t, func() bool { return len(store.snapshot()) == 2 }, 2*time.Second)
 	if got := len(store.snapshot()); got != 2 {
 		t.Fatalf("inserted = %d, want 2 (connection should not have been closed)", got)
 	}
@@ -186,7 +222,7 @@ func TestWS_BadFrameCounterResetsOnValidFrame(t *testing.T) {
 
 func TestWS_InsertFailureSendsErrorAndClosesWith1011(t *testing.T) {
 	store := &fakeStore{failWith: errors.New("simulated pg failure")}
-	srv := newTestServer(t, store)
+	srv := newTestServer(t, store, nil)
 	defer srv.Close()
 
 	conn, _, err := websocket.DefaultDialer.Dial(wsURL(srv.URL, "/ws?client_id=alice"), nil)
@@ -215,5 +251,108 @@ func TestWS_InsertFailureSendsErrorAndClosesWith1011(t *testing.T) {
 	}
 	if ce.Code != websocket.CloseInternalServerErr {
 		t.Fatalf("close code = %d, want %d (1011)", ce.Code, websocket.CloseInternalServerErr)
+	}
+}
+
+func TestWS_PublishesAfterInsert(t *testing.T) {
+	store := &fakeStore{}
+	pub := &fakePublisher{}
+	srv := newTestServer(t, store, pub)
+	defer srv.Close()
+
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL(srv.URL, "/ws?client_id=alice"), nil)
+	if err != nil {
+		t.Fatalf("dial failed: %v", err)
+	}
+	defer conn.Close()
+
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"to":"bob","body":"hello bob"}`)); err != nil {
+		t.Fatalf("write failed: %v", err)
+	}
+
+	waitFor(t, func() bool { return len(pub.snapshot()) == 1 }, 2*time.Second)
+	frames := pub.snapshot()
+	if len(frames) != 1 {
+		t.Fatalf("published = %d, want 1", len(frames))
+	}
+	f := frames[0]
+	if f.channel != "client:bob" {
+		t.Fatalf("channel = %q, want client:bob", f.channel)
+	}
+
+	var got outboundPayload
+	if err := json.Unmarshal(f.payload, &got); err != nil {
+		t.Fatalf("unmarshal payload failed: %v (raw=%s)", err, f.payload)
+	}
+	stored := store.snapshot()
+	if len(stored) != 1 {
+		t.Fatalf("stored = %d, want 1", len(stored))
+	}
+	want := stored[0]
+	if got.ID != want.ID || got.From != "alice" || got.To != "bob" || got.Body != "hello bob" {
+		t.Fatalf("payload = %+v, want id=%s from=alice to=bob body=\"hello bob\"", got, want.ID)
+	}
+	if !got.CreatedAt.Equal(want.CreatedAt) {
+		t.Fatalf("payload CreatedAt = %v, stored CreatedAt = %v", got.CreatedAt, want.CreatedAt)
+	}
+}
+
+func TestWS_PublishFailureDoesNotCloseConnection(t *testing.T) {
+	store := &fakeStore{}
+	pub := &fakePublisher{failWith: errors.New("simulated redis failure")}
+	srv := newTestServer(t, store, pub)
+	defer srv.Close()
+
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL(srv.URL, "/ws?client_id=alice"), nil)
+	if err != nil {
+		t.Fatalf("dial failed: %v", err)
+	}
+	defer conn.Close()
+
+	// First frame: publish will fail, but DB insert succeeds and connection stays open.
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"to":"bob","body":"one"}`)); err != nil {
+		t.Fatalf("write 1 failed: %v", err)
+	}
+	waitFor(t, func() bool { return len(store.snapshot()) == 1 }, 2*time.Second)
+	if n := len(store.snapshot()); n != 1 {
+		t.Fatalf("after publish failure, stored = %d, want 1 (insert must not be rolled back)", n)
+	}
+
+	// Second frame: connection should still be usable.
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"to":"bob","body":"two"}`)); err != nil {
+		t.Fatalf("write 2 failed (connection was closed): %v", err)
+	}
+	waitFor(t, func() bool { return len(store.snapshot()) == 2 }, 2*time.Second)
+	if n := len(store.snapshot()); n != 2 {
+		t.Fatalf("stored = %d, want 2", n)
+	}
+}
+
+func TestWS_PublishNotCalledOnInsertFailure(t *testing.T) {
+	store := &fakeStore{failWith: errors.New("simulated pg failure")}
+	pub := &fakePublisher{}
+	srv := newTestServer(t, store, pub)
+	defer srv.Close()
+
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL(srv.URL, "/ws?client_id=alice"), nil)
+	if err != nil {
+		t.Fatalf("dial failed: %v", err)
+	}
+	defer conn.Close()
+
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"to":"bob","body":"hi"}`)); err != nil {
+		t.Fatalf("write failed: %v", err)
+	}
+
+	// Drain the error + close frames so we know the handler finished its work.
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	for {
+		if _, _, err := conn.ReadMessage(); err != nil {
+			break
+		}
+	}
+
+	if frames := pub.snapshot(); len(frames) != 0 {
+		t.Fatalf("publish called %d times on insert failure, want 0", len(frames))
 	}
 }
