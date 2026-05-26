@@ -1,7 +1,7 @@
 # myWhatsApp — Implementation Plan
 
 **Spec version targeted:** `SPEC.md` v0.3
-**Last updated:** 2026-05-14
+**Last updated:** 2026-05-26
 
 This plan slices `SPEC.md` into ordered tasks. Every task references the
 spec section(s) it implements and has a concrete acceptance criterion. **No
@@ -126,10 +126,61 @@ instrumentation each time we touch a span boundary.
   message `{to:"test2",…}` from a test client → published payload appears
   in the subscriber.
 
-### T2.5 — Redis subscribe per client connection
+### T2.5 — Refactor server into domain-based packages
+
+- **Implements:** project code structure convention
+  (`.claude/skills/domain-structure/SKILL.md`, referenced from `CLAUDE.md`).
+  Pure restructure — no change to observable behavior, no change to
+  `SPEC.md` semantics, no change to the database schema or wire format.
+- **Depends on:** T2.4
+- **What:** Reshape everything under `server/` into the domain-package
+  layout required by the skill. Target layout:
+
+  ```
+  server/
+  ├── main.go            ← composition root only
+  ├── messages/
+  │   ├── domain.go      ← Message, MessageID, errors
+  │   ├── service.go     ← Service: Ingest, FetchPending, MarkDelivered
+  │   ├── service_test.go
+  │   └── dao.go         ← DAO interface + Postgres impl
+  └── connections/
+      ├── domain.go      ← Connection, Registry
+      ├── service.go     ← Service: Register, Unregister, Publish, …
+      ├── service_test.go
+      └── dao.go         ← DAO interface + Redis pub/sub impl
+  ```
+
+  - Move all PostgreSQL access (`*sql.DB`, schema bootstrap, INSERT for
+    T2.3) out of `main.go` into `messages/dao.go` behind a `MessageDAO`
+    interface declared in the same file.
+  - Move all Redis access (publish from T2.4) out of `main.go` into
+    `connections/dao.go` behind a `ConnectionDAO` interface.
+  - Move WebSocket-handler glue and the in-memory connection map into
+    `connections/service.go`.
+  - `main.go` becomes wiring only: construct each DAO with its driver,
+    inject into the corresponding service, register HTTP handlers.
+  - Add unit tests for both services that mock the DAO interface.
+
+- **Acceptance:**
+  1. `cd server && go build ./...` succeeds.
+  2. `cd server && go test ./...` passes.
+  3. Repeat the acceptance checks for T2.2, T2.3, and T2.4 against the
+     refactored binary — all still pass (schema is created on boot, a
+     well-formed message lands in the `messages` table, `redis-cli
+     SUBSCRIBE client:test2` sees the published payload).
+  4. `grep -RE 'database/sql|pgx|github.com/redis' server/messages/service.go server/connections/service.go`
+     returns **no matches** (services depend on DAO interfaces, not
+     infra types — skill rule 3).
+  5. Excluding `_test.go` files, infra imports (`database/sql`, the
+     PG driver, the Redis client) appear in `main.go` and the
+     respective `dao.go` files **only** (skill rule 4 — composition
+     root).
+
+### T2.6 — Redis subscribe per client connection
 
 - **Implements:** §4.3 steps 3 & 5–6, §6.3, §6.5
-- **Depends on:** T2.4
+- **Depends on:** T2.5
 - **What:** On WS accept, subscribe to `client:<id>` and
   `client:<id>:control`. Forward `client:<id>` messages to the WebSocket.
   On WS close, unsubscribe.
@@ -138,10 +189,10 @@ instrumentation each time we touch a span boundary.
   then sending another message from A → B's old subscription is gone (no
   Redis subscribers reported by `PUBSUB NUMSUB client:B`).
 
-### T2.6 — Pending-queue flush + buffer-and-drain
+### T2.7 — Pending-queue flush + buffer-and-drain
 
 - **Implements:** §4.3 steps 4–5, §6.1, §6.4, §10 (write failure)
-- **Depends on:** T2.5
+- **Depends on:** T2.6
 - **What:** Implement the buffer-then-drain protocol from §4.3:
   1. After subscribing, but before flushing, buffer any Redis messages
      in memory.
@@ -164,10 +215,10 @@ instrumentation each time we touch a span boundary.
      delay), have A send a 4th live message. B receives messages 1–3
      before 4, then 4.
 
-### T2.7 — Duplicate `client_id` kick
+### T2.8 — Duplicate `client_id` kick
 
 - **Implements:** §4.1 (kick), §10 (already-connected row)
-- **Depends on:** T2.5
+- **Depends on:** T2.6
 - **What:** On new connection, publish `kick` on `client:<id>:control`.
   Locally, on receiving a `kick` for a client we currently own, close that
   WS with code 4000 and clean up.
@@ -175,10 +226,10 @@ instrumentation each time we touch a span boundary.
   close code 4000 within ~100ms of the second connecting; the second
   remains usable.
 
-### T2.8 — Per-connection write timeout + bad-frames counter
+### T2.9 — Per-connection write timeout + bad-frames counter
 
 - **Implements:** §10 (slow-consumer 10s timeout, 5 bad frames)
-- **Depends on:** T2.3, T2.5
+- **Depends on:** T2.3, T2.6
 - **What:** Use `SetWriteDeadline(time.Now().Add(10s))` before each
   `WriteMessage`. Maintain a per-connection counter for consecutive
   malformed frames; reset on any valid frame.
@@ -186,10 +237,10 @@ instrumentation each time we touch a span boundary.
   deadline fires; connection closes with code 1011 within ~10s of the next
   delivery attempt.
 
-### T2.9 — Graceful shutdown
+### T2.10 — Graceful shutdown
 
 - **Implements:** §6.6 (D12), §10 (SIGTERM row)
-- **Depends on:** T2.5
+- **Depends on:** T2.6
 - **What:** On `SIGTERM`: HTTP handler starts returning 503 for new `/ws`
   upgrades. Iterate active connections, send WS close frame 1001, wait up
   to 10s for ack, force-close after. Hard deadline 30s; configure pod
@@ -198,10 +249,10 @@ instrumentation each time we touch a span boundary.
   process. Client receives a 1001 close. New connections during shutdown
   fail with HTTP 503. Process exits within 30s.
 
-### T2.10 — Server Deployment + Service manifests
+### T2.11 — Server Deployment + Service manifests
 
 - **Implements:** §3.1 (Deployment, scalable), §9 (`server/`)
-- **Depends on:** T2.2 through T2.9
+- **Depends on:** T2.2 through T2.10
 - **What:** `infrastructure/server/{deployment.yaml, service.yaml,
   configmap.yaml}`. ClusterIP Service. Container image built from
   `server/Dockerfile`. Env wiring per §7.1. `terminationGracePeriodSeconds:
@@ -339,7 +390,7 @@ substrate.
 ### T5.1 — Server OTel SDK init
 
 - **Implements:** §7.1 (env), §8 (general)
-- **Depends on:** T2.10, T4.6
+- **Depends on:** T2.11, T4.6
 - **What:** Initialize tracer/meter/logger providers from
   `OTEL_EXPORTER_OTLP_ENDPOINT` + `OTEL_SERVICE_NAME`. Use OTLP gRPC.
   Set `service.name` and `server.replica` (from `SERVER_REPLICA_ID`/`HOSTNAME`,

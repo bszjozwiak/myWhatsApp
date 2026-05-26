@@ -63,6 +63,14 @@ the spec**. If the spec is silent on the question, see "Ambiguity" below.
   TOTAL_CLIENTS`. Identity comes from `HOSTNAME`. Client is a
   StatefulSet; scaling it changes the ring size.
 
+## Code structure convention (binding)
+
+Go code is organized by **domain**, not by layer. Each domain is its
+own package directory containing at minimum three files: `domain.go`
+(types), `service.go` (business logic), `dao.go` (data access). See
+`.claude/skills/domain-structure/SKILL.md` for the full rules. Apply
+this convention to every new file and every refactor.
+
 ## Non-goals (do not implement)
 
 - TLS, authentication, or authorization.
